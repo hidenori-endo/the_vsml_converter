@@ -8,6 +8,60 @@ use vsml_common_image::Image as VsmlImage;
 use vsml_core::schemas::{IVData, ObjectData};
 use vsml_core::{MixingContext, RenderingContext, mix_audio, render_frame_image};
 use wgpu::util::DeviceExt;
+use std::collections::HashSet;
+
+/// フレームごとのアクティブな要素を計算
+fn calculate_frame_changes<I, A>(
+    iv_data: &IVData<I, A>,
+) -> Vec<HashSet<String>> {
+    let ObjectData::Element { duration, .. } = &iv_data.object else {
+        panic!()
+    };
+    let whole_frames = (*duration * iv_data.fps as f64).round() as u32;
+    let mut frame_elements: Vec<HashSet<String>> = vec![HashSet::new(); whole_frames as usize];
+
+    fn collect_active_elements<I, A>(
+        object: &ObjectData<I, A>,
+        frame_elements: &mut [HashSet<String>],
+        fps: u32,
+        path: String,
+        parent_start: f64,
+    ) {
+        match object {
+            ObjectData::Element {
+                start_time,
+                duration,
+                children,
+                attributes: _,
+                ..
+            } => {
+                let global_start = parent_start + start_time;
+                let start_frame = (global_start * fps as f64).floor() as u32;
+                let end_frame = ((global_start + duration) * fps as f64).ceil() as u32;
+
+                // この要素がアクティブなフレームを記録
+                for frame in start_frame..end_frame.min(frame_elements.len() as u32) {
+                    frame_elements[frame as usize].insert(path.clone());
+                }
+
+                // 子要素を再帰的に処理
+                for (i, child) in children.iter().enumerate() {
+                    collect_active_elements(
+                        child,
+                        frame_elements,
+                        fps,
+                        format!("{}/{}", path, i),
+                        global_start,
+                    );
+                }
+            }
+            ObjectData::Text(_) => {}
+        }
+    }
+
+    collect_active_elements(&iv_data.object, &mut frame_elements, iv_data.fps, "root".to_string(), 0.0);
+    frame_elements
+}
 
 pub fn encode<R, M>(
     iv_data: IVData<R::Image, M::Audio>,
@@ -36,14 +90,39 @@ pub fn encode<R, M>(
     let d = d.path();
     info!("一時ディレクトリ: {:?}", d);
 
+    // フレームごとのアクティブな要素を事前計算
+    info!("フレーム変化を解析中...");
+    let frame_changes = calculate_frame_changes(&iv_data);
+
+    // 前フレームの情報を保持
+    let mut last_frame_elements: Option<HashSet<String>> = None;
+    let mut last_frame_path: Option<String> = None;
+    let mut cache_hits = 0;
+    let mut total_renders = 0;
+
     let frame_start = Instant::now();
     for f in 0..whole_frames.round() as u32 {
         let frame_time = Instant::now();
-
-        let frame_image = render_frame_image(&iv_data, f, &mut rendering_context);
-        debug!("フレーム {} レンダリング完了: {:?}", f, frame_time.elapsed());
-
         let save_path = d.join(format!("frame_{}.png", f));
+
+        let current_elements = &frame_changes[f as usize];
+
+        // フレーム間の変化をチェック
+        let should_reuse = last_frame_elements.as_ref()
+            .map(|last| last == current_elements)
+            .unwrap_or(false);
+
+        if should_reuse && last_frame_path.is_some() {
+            // 前フレームをコピー
+            let last_path = last_frame_path.as_ref().unwrap();
+            std::fs::copy(last_path, &save_path).unwrap();
+            cache_hits += 1;
+            debug!("フレーム {} キャッシュから再利用", f);
+        } else {
+            // 新規レンダリング
+            let frame_image = render_frame_image(&iv_data, f, &mut rendering_context);
+            total_renders += 1;
+            debug!("フレーム {} レンダリング完了: {:?}", f, frame_time.elapsed());
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -81,7 +160,7 @@ pub fn encode<R, M>(
         device.poll(wgpu::MaintainBase::Wait);
 
         image::save_buffer(
-            save_path,
+            &save_path,
             &slice.get_mapped_range(),
             iv_data.resolution_x,
             iv_data.resolution_y,
@@ -89,11 +168,27 @@ pub fn encode<R, M>(
         )
         .unwrap();
 
+            // 現在のフレーム情報を保存
+            last_frame_elements = Some(current_elements.clone());
+            last_frame_path = Some(save_path.to_string_lossy().to_string());
+        }
+
         if f % 10 == 0 || f == whole_frames.round() as u32 - 1 {
-            info!("フレーム {}/{} 完了 (累計: {:?})", f + 1, whole_frames.round() as u32, frame_start.elapsed());
+            info!("フレーム {}/{} 完了 (累計: {:?}, キャッシュヒット率: {:.1}%)",
+                f + 1,
+                whole_frames.round() as u32,
+                frame_start.elapsed(),
+                (cache_hits as f64 / (f + 1) as f64) * 100.0
+            );
         }
     }
     info!("全フレーム処理完了: {:?}", frame_start.elapsed());
+    info!("レンダリング統計: 総フレーム数: {}, 実レンダリング: {}, キャッシュ利用: {} (キャッシュヒット率: {:.1}%)",
+        whole_frames.round() as u32,
+        total_renders,
+        cache_hits,
+        (cache_hits as f64 / whole_frames) * 100.0
+    );
 
     let audio_start = Instant::now();
     info!("音声ミキシング開始...");
