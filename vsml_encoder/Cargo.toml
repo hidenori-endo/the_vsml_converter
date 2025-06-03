@@ -12,3 +12,5 @@ hound.workspace = true
 image.workspace = true
 temp-dir.workspace = true
 wgpu.workspace = true
+log.workspace = true
+env_logger.workspace = true

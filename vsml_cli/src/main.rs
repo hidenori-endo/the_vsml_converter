@@ -63,6 +63,7 @@ fn get_gpu_device() -> (wgpu::Device, wgpu::Queue) {
 }
 
 fn main() {
+    env_logger::init();
     let args = Args::parse();
 
     let vsml_string = std::fs::read_to_string(args.input_path).unwrap();

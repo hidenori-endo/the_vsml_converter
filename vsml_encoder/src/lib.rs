@@ -1,5 +1,7 @@
+use log::{info, debug};
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 use temp_dir::TempDir;
 use vsml_common_audio::Audio as VsmlAudio;
 use vsml_common_image::Image as VsmlImage;
@@ -19,6 +21,8 @@ pub fn encode<R, M>(
     R: RenderingContext<Image = VsmlImage>,
     M: MixingContext<Audio = VsmlAudio>,
 {
+    let start_time = Instant::now();
+
     let ObjectData::Element { duration, .. } = iv_data.object else {
         panic!()
     };
@@ -26,11 +30,19 @@ pub fn encode<R, M>(
     assert!(duration.is_finite(), "動画時間が無限になっています");
     let whole_frames = duration * iv_data.fps as f64;
 
+    info!("総フレーム数: {}, 動画時間: {}秒", whole_frames.round() as u32, duration);
+
     let d = TempDir::new().unwrap();
     let d = d.path();
+    info!("一時ディレクトリ: {:?}", d);
 
+    let frame_start = Instant::now();
     for f in 0..whole_frames.round() as u32 {
+        let frame_time = Instant::now();
+
         let frame_image = render_frame_image(&iv_data, f, &mut rendering_context);
+        debug!("フレーム {} レンダリング完了: {:?}", f, frame_time.elapsed());
+
         let save_path = d.join(format!("frame_{}.png", f));
 
         let mut encoder =
@@ -76,9 +88,17 @@ pub fn encode<R, M>(
             image::ColorType::Rgba8,
         )
         .unwrap();
-    }
 
+        if f % 10 == 0 || f == whole_frames.round() as u32 - 1 {
+            info!("フレーム {}/{} 完了 (累計: {:?})", f + 1, whole_frames.round() as u32, frame_start.elapsed());
+        }
+    }
+    info!("全フレーム処理完了: {:?}", frame_start.elapsed());
+
+    let audio_start = Instant::now();
+    info!("音声ミキシング開始...");
     let audio = mix_audio(&iv_data, &mut mixing_context);
+    info!("音声ミキシング完了: {:?}, サンプル数: {}", audio_start.elapsed(), audio.samples.len());
 
     let spec = hound::WavSpec {
         channels: 2,
@@ -92,28 +112,37 @@ pub fn encode<R, M>(
         writer.write_sample(s[1]).unwrap();
     });
     writer.finalize().unwrap();
+    info!("音声ファイル書き込み完了");
 
     let fps = iv_data.fps.to_string();
     let output_path = output_path.unwrap_or(Path::new("output.mp4"));
 
+    let ffmpeg_start = Instant::now();
+    info!("FFmpeg開始...");
     let mut command = Command::new("ffmpeg");
     if overwrite {
         command.arg("-y");
     }
-    command
+    let status = command
         .arg("-r")
         .arg(&fps)
         .arg("-i")
         .arg(d.join("frame_%d.png"))
         .arg("-i")
         .arg(d.join("audio.wav"))
-        .arg("-vcodec")
-        .arg("libx264")
-        .arg("-acodec")
+        .arg("-c:v")
+        .arg("h264_nvenc")
+        .arg("-c:a")
         .arg("aac")
+        .arg("-shortest")
+        .arg("-pix_fmt")
+        .arg("yuv420p")       // 互換性のための色空間
         .arg(output_path)
         .spawn()
         .unwrap()
         .wait()
         .unwrap();
+
+    info!("FFmpeg完了: {:?}, ステータス: {:?}", ffmpeg_start.elapsed(), status);
+    info!("総処理時間: {:?}", start_time.elapsed());
 }
