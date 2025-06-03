@@ -11,3 +11,5 @@ vsml_core.workspace = true
 hound.workspace = true
 image.workspace = true
 wgpu.workspace = true
+log.workspace = true
+env_logger.workspace = true

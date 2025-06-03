@@ -8,3 +8,5 @@ authors.workspace = true
 vsml_core.workspace = true
 vsml_common_audio.workspace = true
 dasp.workspace = true
+log.workspace = true
+env_logger.workspace = true
